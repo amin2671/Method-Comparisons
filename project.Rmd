@@ -1,0 +1,165 @@
+---
+title: "Diabetes in Pima Native Americans"
+author: "Andrew Min"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE)
+
+library(caret)
+library(splitstackshape)
+library(corrplot)
+library(pROC)
+library(kernlab)
+library(mice)
+library(VIM)
+
+# reading in data
+diabetes <- read.csv("diabetes.csv")
+
+# changing target variable to factor
+diabetes$Outcome <- as.factor(diabetes$Outcome)
+
+# shortening DiabetesPedigreeFunction to DPF
+colnames(diabetes)[7] <- c("DPF")
+```
+
+```{r exploratory data analysis, message=FALSE, warning=FALSE}
+# No highly correlated predictors
+nearZeroVar(diabetes)
+
+# data is imbalanced
+barplot(table(diabetes$Outcome))
+```
+
+```{r missing data, message=FALSE, warning=FALSE}
+# change zero values to their true missing values
+diabetes$Glucose[diabetes$Glucose == 0] <- NA
+diabetes$BloodPressure[diabetes$BloodPressure == 0] <- NA
+diabetes$SkinThickness[diabetes$SkinThickness == 0] <- NA
+diabetes$Insulin[diabetes$Insulin == 0] <- NA
+diabetes$BMI[diabetes$BMI == 0] <- NA
+
+# plotting proportion of missing values
+aplot <- aggr(diabetes, plot=FALSE)
+plot(aplot, cex.axis=.7)
+
+# remove high proportion of missing values: Insulin and SkinThickness
+diabetes <- diabetes[-c(4:5)]
+
+# impute missing values
+imp.diabetes <- mice(diabetes, m=5, maxit=50, method='pmm', printFlag = FALSE, seed=768)
+diabetes <- complete(imp.diabetes,1)
+```
+
+```{r corrplot after mice, message=FALSE, warning=FALSE}
+# check correlation after imputing and removing missing values
+corrplot(cor(diabetes[-7]),method='number')
+
+# check density plots
+par(mfrow=c(2,3))
+for(i in 1:ncol(diabetes[-7])) {
+  plot(density(diabetes[,i], na.rm=TRUE), main=paste(names(diabetes[i]), 'Density Plot'))
+}
+```
+
+```{r preprocessing after, message=FALSE, warning=FALSE}
+# preprocess data to check correlation and density plots
+prepped <- preProcess(diabetes[-7], method = c("center","scale","BoxCox","pca"))
+processed <- predict(prepped, diabetes[-7])
+
+corrplot(cor(processed),method='number')
+
+par(mfrow=c(2,3))
+for(i in 1:ncol(processed)) {
+  plot(density(processed[,i], na.rm=TRUE), main=paste(names(processed[i]), 'Density Plot'))
+}
+```
+
+```{r prep, message=FALSE, warning=FALSE}
+set.seed(768)
+
+# perform stratified train/test splits due to imbalanced data
+x <- stratified(diabetes, group=c("Outcome"), size=.7, bothSets = TRUE)
+# x$SAMP1 = train split
+# x$SAMP2 = test split
+
+# change factors of target variable to no and yes
+levels(x$SAMP1$Outcome) <- c("no", "yes")
+levels(x$SAMP2$Outcome) <- c("no", "yes")
+
+# 10-fold cross validation
+ctrl <- trainControl(method = "cv", number=10, classProbs = TRUE)
+```
+
+```{r training, message=FALSE, warning=FALSE}
+set.seed(768)
+# logistic regression
+diabetes.log <- train(Outcome ~ .,
+                      data=x$SAMP1,
+                      method = "glm",
+                      trControl = ctrl,
+                      trace = FALSE,
+                      preProcess = c("center","scale","BoxCox","pca"))
+
+set.seed(768)
+# random forest
+diabetes.rforest <- train(Outcome ~ .,
+                          data=x$SAMP1,
+                          method = "rf",
+                          tuneGrid = data.frame(mtry=1:8),
+                          ntree = 500,
+                          trControl = ctrl,
+                          importance = TRUE,
+                          trace = FALSE,
+                          preProcess = c("center","scale","BoxCox","pca"))
+
+set.seed(768)
+# support vector machine
+diabetes.svm <- train(Outcome ~ .,
+                      data=x$SAMP1,
+                      method = "svmRadial",
+                      tuneLength = 10,
+                      trControl = ctrl,
+                      trace = FALSE,
+                      preProcess = c("center","scale","BoxCox","pca"))
+```
+
+```{r metrics, message=FALSE, warning=FALSE}
+# evaluation metrics
+
+pred.log     <- predict(diabetes.log, x$SAMP2[,-7], type="prob")[,1]
+pred.rforest <- predict(diabetes.rforest, x$SAMP2[,-7], type="prob")[,1]
+pred.svm     <- predict(diabetes.svm, x$SAMP2[,-7], type="prob")[,1]
+
+alog <- auc(x$SAMP2$Outcome, factor(pred.log, ordered=TRUE))
+afor <- auc(x$SAMP2$Outcome, factor(pred.rforest, ordered=TRUE))
+asvm <- auc(x$SAMP2$Outcome, factor(pred.svm, ordered=TRUE))
+
+clog<-confusionMatrix(x$SAMP2$Outcome, factor(predict(diabetes.log, x$SAMP2), ordered=TRUE))
+crfo<-confusionMatrix(x$SAMP2$Outcome, factor(predict(diabetes.rforest, x$SAMP2), ordered=TRUE))
+csvm<-confusionMatrix(x$SAMP2$Outcome, factor(predict(diabetes.svm, x$SAMP2), ordered=TRUE))
+
+metrics <- data.frame(AUC = c(alog, afor, asvm),
+                      Sensitivity = c(clog$byClass[1], crfo$byClass[1], csvm$byClass[1]),
+                      Specificity = c(clog$byClass[2], crfo$byClass[2], csvm$byClass[2]),
+                      Accuracy = c(clog$overall[1], crfo$overall[1], csvm$overall[1]),
+                      Kappa = c(clog$overall[2], crfo$overall[2], csvm$overall[2]))
+metrics
+```
+
+```{r roc, message=FALSE, warning=FALSE}
+# roc curve
+
+logroc <- roc(x$SAMP2$Outcome, factor(pred.log, ordered=TRUE))
+plot(logroc, col=1, lty=1, lwd=2, main="ROC Curve")
+
+rforoc <- roc(x$SAMP2$Outcome, factor(pred.rforest, ordered=TRUE))
+lines(rforoc, col=2, lty=2, lwd=2)
+
+svmroc <- roc(x$SAMP2$Outcome, factor(pred.svm, ordered=TRUE))
+lines(svmroc, col=3, lty=5, lwd=2)
+
+legend('bottomright', c('logistic','random forest','svm'), col=c(1,2,3), lty=c(1,2,5),lwd=2)
+```
